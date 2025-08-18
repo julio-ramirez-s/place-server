@@ -9,7 +9,15 @@ const uri = "mongodb+srv://julioramirezs2008:JDRS2008@cluster0.mvtvanq.mongodb.n
 const app = express();
 const PORT = process.env.PORT || 4000;
 const server = http.createServer(app);
-const io = socketIo(server);
+
+// Initialize Socket.IO with CORS configuration
+const io = socketIo(server, {
+  cors: {
+    origin: "https://place-kpx7.onrender.com", // Allow requests from your frontend URL
+    methods: ["GET", "POST"], // Allow specified HTTP methods
+    credentials: true // Allow cookies to be sent with cross-origin requests
+  }
+});
 
 // Middleware para el cuerpo de las peticiones JSON
 app.use(express.json());
@@ -131,6 +139,7 @@ io.on('connection', (socket) => {
       }
 
       // Actualizar o crear el píxel en la base de datos
+      // findOneAndUpdate con upsert: true es atómico para esta operación
       await Pixel.findOneAndUpdate(
         { x, y },
         { color, userId: currentUserId },
