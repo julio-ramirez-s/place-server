@@ -1,176 +1,140 @@
 const express = require('express');
-const path = require('path');
 const http = require('http');
-const socketIo = require('socket.io');
-const mongoose = require('mongoose');
-const bcrypt = require('bcrypt');
-const uri = "mongodb+srv://julioramirezs2008:JDRS2008@cluster0.mvtvanq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
+const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 4000;
+app.use(cors());
+
 const server = http.createServer(app);
 
-// Initialize Socket.IO with CORS configuration
-const io = socketIo(server, {
+// Configuración de Socket.io para permitir conexión desde el cliente React
+const io = new Server(server, {
   cors: {
-    origin: "https://place-kpx7.onrender.com", // Allow requests from your frontend URL
-    methods: ["GET", "POST"], // Allow specified HTTP methods
-    credentials: true // Allow cookies to be sent with cross-origin requests
+    origin: "https://place-kpx7.onrender.com", // Asegúrate de que esto coincida con tu puerto de React
+    methods: ["GET", "POST"]
   }
 });
 
-// Middleware para el cuerpo de las peticiones JSON
-app.use(express.json());
+// --- ESTADO DEL JUEGO (Memoria del Servidor) ---
+// Nota: Si reinicias el servidor, esto se resetea. Para guardar permanente, usa MongoDB aquí.
+let gameState = {
+  players: {}, // { socketId: { id, name, avatar, room, action, x, y } }
+  pet: {
+    name: "Mochi",
+    type: "cat", // 'cat' o 'dog'
+    hunger: 80, // 0 a 100
+    happiness: 60, // 0 a 100
+  },
+  loveMeter: 0, // Medidor de amor acumulado
+  weather: 'sunny' 
+};
 
-// Conexión a MongoDB
-mongoose.connect(uri, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-}).then(() => console.log('Conectado a MongoDB Atlas'))
-  .catch(err => console.error('Fallo al conectar a MongoDB', err));
-
-// Modelos de Mongoose
-const userSchema = new mongoose.Schema({
-  username: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-  pixelCredits: { type: Number, default: 100 }, // Cambiado a 100 píxeles iniciales
-});
-
-const pixelSchema = new mongoose.Schema({
-  x: { type: Number, required: true },
-  y: { type: Number, required: true },
-  color: { type: String, required: true },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-});
-
-const User = mongoose.model('User', userSchema);
-const Pixel = mongoose.model('Pixel', pixelSchema);
-
-// Lógica para añadir píxeles a los usuarios conectados
-setInterval(async () => {
-  // Obtener los IDs de usuario de los sockets conectados que tienen un userId asignado
-  const connectedUserIds = Object.values(io.sockets.sockets)
-                                .filter(s => s.userId)
-                                .map(s => s.userId);
-
-  if (connectedUserIds.length > 0) {
-    // Aumentar los créditos de píxeles para todos los usuarios conectados en la base de datos
-    await User.updateMany({ _id: { $in: connectedUserIds } }, { $inc: { pixelCredits: 1 } });
-    
-    // Notificar a cada cliente individualmente sobre sus nuevos créditos
-    for (const socketId in io.sockets.sockets) {
-      const socket = io.sockets.sockets[socketId];
-      if (socket.userId) {
-        // Recuperar el usuario actualizado de la base de datos para obtener el valor más reciente
-        const user = await User.findById(socket.userId);
-        if (user) {
-          socket.emit('updatePixelCredits', { pixelCredits: user.pixelCredits });
-        }
-      }
-    }
+// --- BUCLE DEL JUEGO ---
+// Reduce las estadísticas de la mascota cada 10 segundos para simular vida
+setInterval(() => {
+  let changed = false;
+  
+  // La mascota tiene hambre poco a poco
+  if (gameState.pet.hunger > 0) {
+    gameState.pet.hunger -= 2;
+    changed = true;
   }
-}, 5000); // Cambiado a 5 segundos (5000 ms) para la acumulación de píxeles
+  
+  // La mascota se aburre poco a poco
+  if (gameState.pet.happiness > 0) {
+    gameState.pet.happiness -= 1;
+    changed = true;
+  }
 
-// Manejo de Conexiones Socket.IO
+  // Si hubo cambios, enviamos actualización a todos
+  if (changed) {
+    io.emit('game_update', gameState);
+  }
+}, 10000);
+
+// --- GESTIÓN DE SOCKETS ---
 io.on('connection', (socket) => {
-  console.log(`Usuario conectado: ${socket.id}`);
+  console.log('Usuario conectado:', socket.id);
 
-  let currentUserId = null; // Para almacenar el ID del usuario logueado en este socket
+  // 1. Unirse a la casa
+  socket.on('join_house', ({ name, avatar }) => {
+    gameState.players[socket.id] = {
+      id: socket.id,
+      name,
+      avatar,
+      room: 'living', // Sala inicial
+      action: 'Acaba de llegar',
+    };
+    
+    // Enviar estado actual inmediatamente al que entra
+    socket.emit('game_update', gameState);
+    // Avisar a los demás
+    socket.broadcast.emit('game_update', gameState);
+  });
 
-  // Evento: Registro de nuevo usuario
-  socket.on('register', async ({ username, password }) => {
-    try {
-      const hashedPassword = await bcrypt.hash(password, 10);
-      const newUser = new User({ username, password: hashedPassword, pixelCredits: 100 }); // Asegura 100 píxeles al registrar
-      await newUser.save();
-      socket.emit('authSuccess', 'Registro exitoso. ¡Puedes iniciar sesión!');
-    } catch (error) {
-      console.error('Error durante el registro:', error);
-      socket.emit('authError', 'Error al registrar. El nombre de usuario puede ya existir.');
+  // 2. Moverse de habitación
+  socket.on('move_room', (roomId) => {
+    if (!gameState.players[socket.id]) return;
+
+    const roomActions = {
+      bedroom: 'Descansando 💤',
+      kitchen: 'Comiendo algo 🍪',
+      living: 'Viendo TV 📺',
+      garden: 'Tomando aire 🌳'
+    };
+
+    // Actualizar jugador
+    gameState.players[socket.id].room = roomId;
+    gameState.players[socket.id].action = roomActions[roomId] || 'Explorando';
+
+    // LÓGICA ROMÁNTICA:
+    // Si hay más de un jugador en la misma habitación, sube el "Love Meter"
+    const players = Object.values(gameState.players);
+    if (players.length > 1) {
+      // Filtrar jugadores en la misma sala que no sean yo
+      const othersInRoom = players.filter(p => p.id !== socket.id && p.room === roomId);
+      
+      if (othersInRoom.length > 0) {
+        gameState.loveMeter = Math.min(100, gameState.loveMeter + 5);
+        io.emit('notification', `¡${gameState.players[socket.id].name} se unió a ${othersInRoom[0].name} en ${roomId}! ❤️`);
+      }
+    }
+
+    io.emit('game_update', gameState);
+  });
+
+  // 3. Cuidar Mascota
+  socket.on('interact_pet', (action) => {
+    if (action === 'feed') {
+      gameState.pet.hunger = Math.min(100, gameState.pet.hunger + 20); // Sube comida
+      io.emit('notification', '¡Mascota alimentada! 🍖');
+    } else if (action === 'play') {
+      gameState.pet.happiness = Math.min(100, gameState.pet.happiness + 20); // Sube felicidad
+      io.emit('notification', '¡Jugando con la mascota! 🎾');
+    }
+    io.emit('game_update', gameState);
+  });
+
+  // 4. Enviar Beso
+  socket.on('send_kiss', () => {
+    const sender = gameState.players[socket.id];
+    if (sender) {
+      gameState.loveMeter = Math.min(100, gameState.loveMeter + 10);
+      io.emit('special_effect', { type: 'kiss', from: sender.name });
+      io.emit('game_update', gameState);
     }
   });
 
-  // Evento: Inicio de sesión de usuario
-  socket.on('login', async ({ username, password }) => {
-    try {
-      const user = await User.findOne({ username });
-      if (!user) {
-        socket.emit('authError', 'Usuario no encontrado.');
-        return;
-      }
-      const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch) {
-        socket.emit('authError', 'Contraseña incorrecta.');
-        return;
-      }
-
-      // Guardar el ID del usuario en el socket para referencia futura
-      socket.userId = user._id;
-      currentUserId = user._id;
-
-      // Cargar todos los píxeles del lienzo y enviarlos al cliente
-      const allPixels = await Pixel.find({});
-      socket.emit('allPixels', allPixels);
-
-      // Notificar al cliente que ha iniciado sesión con sus créditos actuales
-      socket.emit('loginSuccess', { username: user.username, pixelCredits: user.pixelCredits });
-      console.log(`${user.username} (${socket.id}) ha iniciado sesión.`);
-
-    } catch (error) {
-      console.error('Error durante el inicio de sesión:', error);
-      socket.emit('authError', 'Error al iniciar sesión.');
-    }
-  });
-
-  // Evento: Un usuario intenta colocar un píxel
-  socket.on('placePixel', async ({ x, y, color }) => {
-    if (!currentUserId) {
-      socket.emit('pixelError', 'Debes iniciar sesión para colocar píxeles.');
-      return;
-    }
-
-    try {
-      const user = await User.findById(currentUserId);
-      // La verificación de créditos para la colocación de píxeles ha sido eliminada.
-      // Los créditos ahora solo se acumulan y se muestran.
-      if (!user) { // Asegúrate de que el usuario exista
-        socket.emit('pixelError', 'Usuario no encontrado.');
-        return;
-      }
-
-      // Actualizar o crear el píxel en la base de datos
-      // findOneAndUpdate con upsert: true es atómico para esta operación
-      await Pixel.findOneAndUpdate(
-        { x, y },
-        { color, userId: currentUserId },
-        { new: true, upsert: true } // new: true devuelve el documento modificado; upsert: true crea si no existe
-      );
-
-      // Transmitir el píxel colocado a todos los clientes en tiempo real
-      io.emit('pixelPlaced', { x, y, color, userId: currentUserId });
-      console.log(`Pixel colocado en (${x}, ${y}) por ${user.username}`);
-
-    } catch (error) {
-      console.error('Error al colocar el píxel:', error);
-      socket.emit('pixelError', 'Error al colocar el píxel.');
-    }
-  });
-
-  // Evento: Desconexión del cliente
+  // Desconexión
   socket.on('disconnect', () => {
-    console.log(`Usuario desconectado: ${socket.id}`);
+    console.log('Usuario desconectado:', socket.id);
+    delete gameState.players[socket.id];
+    io.emit('game_update', gameState);
   });
 });
 
-// Sirve los archivos estáticos desde la carpeta 'build' del cliente (React app)
-app.use(express.static(path.join(__dirname, '../client/build')));
-
-// Para cualquier otra ruta, sirve el archivo index.html de tu aplicación React
-app.get(/^(?!.*\.).*$/, (req, res) => {
-  res.sendFile(path.join(__dirname, '../client/build', 'index.html'));
-});
-
-// Iniciar el servidor HTTP
+const PORT = 3001;
 server.listen(PORT, () => {
-  console.log(`Servidor escuchando en el puerto ${PORT}`);
+  console.log(`🏠 Servidor del Nido de Amor corriendo en puerto ${PORT}`);
 });
